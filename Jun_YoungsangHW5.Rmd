@@ -1,0 +1,593 @@
+---
+title: "HW5A - Recidivism Memo"
+author: "Jun, Youngsang"
+date: "November 15, 2024"
+output: 
+  html_document: 
+    theme: readable
+    code_folding: hide
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+::: {style="text-align: center;"}
+Department of Prisons\
+**City of Emil**
+:::
+
+::: {style="text-indent: -30px; margin-left: 30px;"}
+**To**: Mayor,\
+City of Emil
+:::
+::: {style="text-indent: -30px; margin-left: 30px;"}
+**Thru**: Chief,\
+Department of Prisons
+:::
+::: {style="text-indent: -50px; margin-left: 50px;"}
+**From**: Jun, Youngsang\
+Deputy Director, Data Scientist,\
+Department of Prisions\
+:::
+
+::: {style="text-indent: -20px; margin-left: 20px;"}
+**Date of Memo**: November 15, 2024
+:::
+
+::: {style="text-indent: -20px; margin-left: 20px;"}
+**SUBJECT**: Recommendation to Enhance the Job Training Program for Ex-offenders with a New Recidivism Algorithm
+:::
+
+**1. Background**
+
+::: {style="text-indent: 40px; margin-left: 0px;"}
+\"A rehabilitated prisoner is not one who learns to survive well in prison but one who succeeds in the world outside prison on release.\" [1](Coyle, 2009) Emil City has operated an ex-offender job training program based on this principle. In particular, for inmates with a recidivism risk below 50%, subsidy for education is enhanced by offering incentives three times higher than those given to inmates with a recidivism risk above 50%. However, recent austerity measures have limited the budget, and some officials have raised concerns about expanding the City’s limited job training resources on ex-offenders who recidivate shortly after their release is not good policy. There have also been ongoing concerns about the fairness of predicting recidivism rates across races. To improve the program’s efficiency, a new recidivism risk prediction algorithm should be considered. This recommendation outlines an improvement plan based on a cost-benefit analysis of recidivism risk predictions using the data of 7,214 inmates over 2013–2014.
+:::
+
+```{r setup, include=FALSE, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(lubridate)
+library(tidyverse)
+library(caret)
+library(kableExtra)
+library(ModelMetrics)
+library(plotROC)
+library(knitr)
+library(grid)
+library(gridExtra)
+library(QuantPsyc)
+library(glue)
+library(cowplot)
+#install.packages("QuantPsyc")
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+palette_9_colors <- c("#FF2AD4","#E53AD8","#CC4ADC","#996AE5","#7F7BE9",
+                      "#668BED","#33ABF6","#19BBFA","#00CCFF")
+palette_3_colors <- c("#FF2AD4","#7F7BE9","#00CCFF")
+palette_2_colors <- c("#FF2AD4", "#00CCFF")
+palette_1_colors <- c("#00CCFF")
+```
+
+
+**2. Improvements of the Current Prediction Accuracy**
+
+a. Aspect of Prediction Accuracy
+
+::: {style="text-indent: 40px; margin-left: 20px;"}
+The current recidivism risk prediction model uses OLS binomial multi-regression using the recidivism as a dependent variable, the gender of the person (`sex`), the categorized age of the person (`age_cat`), the number of prior non-felony, juvenile convictions (`juv_other_count`), how long the person stayed in jail (`length_of_stay`), and the number of prior crimes committed (categorized, `priors_count`) as independent variables. The following Figure 1 shows the result of the comparison between observed and predicted by the model using the data of 6,162 inmates over 2013–2014. In the threshold of 0.5, about 45% of ex-offenders are observed to recidivate, but only 40% are predicted to do so. If the threshold is 0.6, the prediction model underestimates the recidivism rate, and if the threshold is 0.4, the prediction model overestimates the recidivism rate.
+:::
+
+```{r setup2, warning = FALSE, message = FALSE}
+raw_data <- read.csv(file.path(root.dir,"Chapter7/compas-scores-two-years.csv"))
+
+df <- 
+  raw_data %>%
+  filter(days_b_screening_arrest <= 30) %>%
+  filter(days_b_screening_arrest >= -30) %>%
+  filter(is_recid != -1) %>%
+  filter(c_charge_degree != "O") %>%
+  filter(priors_count != "36") %>%
+  filter(priors_count != "25") %>%
+  mutate(length_of_stay = as.numeric(as.Date(c_jail_out) - as.Date(c_jail_in)),
+         priors_count = as.factor(priors_count),
+         Recidivated = as.factor(ifelse(two_year_recid == 1,"Recidivate","notRecidivate")),
+         recidivatedNumeric = ifelse(Recidivated == "Recidivate", 1, 0),
+         race2 = case_when(race == "Caucasian"        ~ "Caucasian",
+                           race == "African-American" ~ "African-American", 
+                           TRUE                       ~ "Other")) %>%
+  dplyr::select(sex,age,age_cat,race,race2,priors_count,two_year_recid,r_charge_desc,
+         c_charge_desc,c_charge_degree,r_charge_degree,juv_other_count,
+         length_of_stay,priors_count,Recidivated,recidivatedNumeric) %>%
+  filter(priors_count != 38)
+```
+
+```{r reg, warning = FALSE, message = FALSE}
+train <- df %>% dplyr::sample_frac(.75)
+train_index <- as.numeric(rownames(train))
+test <- df[-train_index, ]
+
+reg.noRace <- glm(Recidivated ~ ., data = 
+                    train %>% dplyr::select(sex, age_cat,
+                                juv_other_count, length_of_stay, 
+                                priors_count, Recidivated),
+                family = "binomial"(link = "logit"))
+
+summary(reg.noRace)
+```
+
+```{r regtest, warning = FALSE, message = FALSE}
+testProbs <- 
+  data.frame(class = test$recidivatedNumeric,
+             probs = predict(reg.noRace, test, type = "response"),
+             Race = test$race2)
+```
+
+```{r fig1, fig.height=10, fig.width=5, warning = FALSE, message = FALSE}
+op_tot <- mutate(testProbs, predClass = ifelse(probs >= .5, 1, 0)) %>%
+  summarize(Observed.recidivism = sum(class) / n(),
+            Predicted.recidivism = sum(predClass) / n()) %>%
+  gather(Variable, Value) %>%
+  ggplot() +
+  ylim(0,1)+
+    geom_bar(aes(x = Variable, y = Value), position="dodge", stat="identity") +
+    labs(title = "Observed and predicted recidivism (threshold = 0.5)", x = "Type", y = "Rate",
+         caption = "") +
+    plotTheme() + theme(axis.text.x = element_text(angle = 5, hjust = 1), legend.position="none")
+
+op <- mutate(testProbs, predClass = ifelse(probs >= .5, 1, 0)) %>%
+  group_by(Race) %>%
+  summarize(Observed.recidivism = sum(class) / n(),
+            Predicted.recidivism = sum(predClass) / n()) %>%
+  gather(Variable, Value, -Race) %>%
+  ggplot(aes(Race, Value)) +
+    geom_bar(aes(fill = Race), position="dodge", stat="identity") +
+    scale_fill_manual(values = palette_3_colors) +
+    facet_wrap(~Variable) +
+    labs(title = "", x = "Race", y = "Rate", caption = "") +
+    plotTheme() + theme(axis.text.x = element_text(angle = 5, hjust = 1), legend.position="none")
+
+op_tot6 <- mutate(testProbs, predClass = ifelse(probs >= .6, 1, 0)) %>%
+  summarize(Observed.recidivism = sum(class) / n(),
+            Predicted.recidivism = sum(predClass) / n()) %>%
+  gather(Variable, Value) %>%
+  ggplot() +
+  ylim(0,1)+
+    geom_bar(aes(x = Variable, y = Value), position="dodge", stat="identity") +
+    labs(title = "Observed and predicted recidivism (threshold = 0.6)", x = "Type", y = "Rate",
+         caption = "") +
+    plotTheme() + theme(axis.text.x = element_text(angle = 5, hjust = 1), legend.position="none")
+
+op6 <- mutate(testProbs, predClass = ifelse(probs >= .6, 1, 0)) %>%
+  group_by(Race) %>%
+  summarize(Observed.recidivism = sum(class) / n(),
+            Predicted.recidivism = sum(predClass) / n()) %>%
+  gather(Variable, Value, -Race) %>%
+  ggplot(aes(Race, Value)) +
+    geom_bar(aes(fill = Race), position="dodge", stat="identity") +
+    scale_fill_manual(values = palette_3_colors) +
+    facet_wrap(~Variable) +
+    labs(title = "", x = "Race", y = "Rate", caption = "") +
+    plotTheme() + theme(axis.text.x = element_text(angle = 5, hjust = 1), legend.position="none")
+
+op_tot4 <- mutate(testProbs, predClass = ifelse(probs >= .4, 1, 0)) %>%
+  summarize(Observed.recidivism = sum(class) / n(),
+            Predicted.recidivism = sum(predClass) / n()) %>%
+  gather(Variable, Value) %>%
+  ggplot() +
+  ylim(0,1)+
+    geom_bar(aes(x = Variable, y = Value), position="dodge", stat="identity") +
+    labs(title = "Observed and predicted recidivism (threshold = 0.4)", x = "Type", y = "Rate",
+         caption = "Figure 1") +
+    plotTheme() + theme(axis.text.x = element_text(angle = 5, hjust = 1), legend.position="none")
+
+op4 <- mutate(testProbs, predClass = ifelse(probs >= .4, 1, 0)) %>%
+  group_by(Race) %>%
+  summarize(Observed.recidivism = sum(class) / n(),
+            Predicted.recidivism = sum(predClass) / n()) %>%
+  gather(Variable, Value, -Race) %>%
+  ggplot(aes(Race, Value)) +
+    geom_bar(aes(fill = Race), position="dodge", stat="identity") +
+    scale_fill_manual(values = palette_3_colors) +
+    facet_wrap(~Variable) +
+    labs(title = "", x = "Race", y = "Rate", caption = "") +
+    plotTheme() + theme(axis.text.x = element_text(angle = 5, hjust = 1), legend.position="none")
+
+grid.arrange(
+  op_tot, op, op_tot6, op6, op_tot4, op4, ncol = 2, widths=c(1,2)
+)
+```
+
+b. Aspect of Cost/benefit
+
+::: {style="text-indent: 40px; margin-left: 20px;"}
+The aspect of cost/benefit estimates the revenues associated with using the improved model under the following scenario. The cost-benefit table is as Table 1. 
+:::
+
+```         
+(1) True Positive: The person was predicted to recidivate and actually recidivated. Allocated one-third of the education resources, the annual education cost of $1,200 per person is included in the cost.[2] Since recidivated ex-offenders are estimated to cost the state of Pennsylvania $45,000 per year, it is also included in the cost.[3] No benefit is generated because the person recidivated.
+   - Cost: ( -$100 × 12 months for education -$45,000 ) × Count
+   - Benefit: 0
+   
+(2) True Negative: The person was predicted not to recidivate and actually did not recidivate. Allocated 100% of the education resources, the annual education cost of $3,600 per person is included in the cost. Assuming the person get a job and get minimum wage, the benefit is calculated as $7.25/hr × 40hr/week × 52 weeks/yr = $15,080 [4] 
+   - Cost: ( -$300 × 12 months for education ) × Count
+   - Benefit: $15,080 × Count
+
+(3) False Positive: The person was predicted to recidivate and actually did not recidivate. Allocated one-third of the education resources, the annual education cost of $1,200 per person is included in the cost. Assuming the person get a job and get minimum wage, the benefit is calculated as $7.25/hr × 40hr/week × 52 weeks/yr = $15,080.
+   - Cost: ( -$100 × 12 months for education ) × Count
+   - Benefit: $15,080 × Count
+   
+(4) False Negative: The person was predicted not to recidivate and actually recidivated. Allocated 100% of the education resources, the annual education cost of $3,600 per person is included in the cost. No benefit is generated because the person recidivated.
+   - Cost: ( -$300 × 12 months for education -$45,000 ) × Count
+   - Benefit: $0
+```
+
+::: {style="text-indent: 40px; margin-left: 20px;"}
+The current revenue in the 50% threshold for the test group is -\$23.1M. In the 60% threshold, False Negative increases than 50% threshold, so the total revenue will be -\$23.6M, while in the 40% threshold, False Negative decreases than 50% threshold, so the total revenue will be -\$22.5M. Comparing the whole threshold from 0.01 to 1.00, the threshold that makes the maximum revenue is as Figure 2. The optimal threshold is from 0.01 to 0.12, and the total revenue is -\$20.9M, but considering accuracy, the threshold 0.4 is accepted among 0.4, 0.5, and 0.6, which can save $1.4M per 3,500 inmates per year.
+:::
+
+```{r iter, warning = FALSE, message = FALSE}
+iterateThresholds <- function(data, observedClass, predictedProbs, group) {
+  observedClass <- enquo(observedClass)
+  predictedProbs <- enquo(predictedProbs)
+  group <- enquo(group)
+  x = .01
+  all_prediction <- data.frame()
+  
+  if (missing(group)) {
+  
+    while (x <= 1) {
+    this_prediction <- data.frame()
+    
+    this_prediction <-
+      data %>%
+      mutate(predclass = ifelse(!!predictedProbs > x, 1,0)) %>%
+      count(predclass, !!observedClass) %>%
+      summarize(Count_TN = sum(n[predclass==0 & !!observedClass==0]),
+                Count_TP = sum(n[predclass==1 & !!observedClass==1]),
+                Count_FN = sum(n[predclass==0 & !!observedClass==1]),
+                Count_FP = sum(n[predclass==1 & !!observedClass==0]),
+                Rate_TP = Count_TP / (Count_TP + Count_FN),
+                Rate_FP = Count_FP / (Count_FP + Count_TN),
+                Rate_FN = Count_FN / (Count_FN + Count_TP),
+                Rate_TN = Count_TN / (Count_TN + Count_FP),
+                Accuracy = (Count_TP + Count_TN) / 
+                           (Count_TP + Count_TN + Count_FN + Count_FP)) %>%
+      mutate(Threshold = round(x,2))
+    
+    all_prediction <- rbind(all_prediction,this_prediction)
+    x <- x + .01
+  }
+  return(all_prediction)
+  }
+  else if (!missing(group)) { 
+   while (x <= 1) {
+    this_prediction <- data.frame()
+    
+    this_prediction <-
+      data %>%
+      mutate(predclass = ifelse(!!predictedProbs > x, 1,0)) %>%
+      group_by(!!group) %>%
+      count(predclass, !!observedClass) %>%
+      summarize(Count_TN = sum(n[predclass==0 & !!observedClass==0]),
+                Count_TP = sum(n[predclass==1 & !!observedClass==1]),
+                Count_FN = sum(n[predclass==0 & !!observedClass==1]),
+                Count_FP = sum(n[predclass==1 & !!observedClass==0]),
+                Rate_TP = Count_TP / (Count_TP + Count_FN),
+                Rate_FP = Count_FP / (Count_FP + Count_TN),
+                Rate_FN = Count_FN / (Count_FN + Count_TP),
+                Rate_TN = Count_TN / (Count_TN + Count_FP),
+                Accuracy = (Count_TP + Count_TN) / 
+                           (Count_TP + Count_TN + Count_FN + Count_FP)) %>%
+      mutate(Threshold = round(x, 2))
+    
+    all_prediction <- rbind(all_prediction, this_prediction)
+    x <- x + .01
+  }
+  return(all_prediction)
+  }
+}
+
+testProbs.thresholds <- 
+  iterateThresholds(data=testProbs, observedClass = class, 
+                    predictedProbs = probs, group = Race)
+
+testProbs.thresholds_All <- 
+  iterateThresholds(data=testProbs, observedClass = class, 
+                    predictedProbs = probs)
+```
+
+
+```{r confmat, warning = FALSE, message = FALSE}
+grid.arrange(ncol = 3,
+filter(testProbs.thresholds_All, Threshold == .5)  %>%
+  dplyr::select(Accuracy, starts_with("Rate")) %>%
+  gather(Variable, Value) %>%
+    ggplot(aes(Variable, Value)) +
+      geom_bar(stat = "identity") +
+      ylim(0,1)+
+      labs(title="Confusion matrix rate",
+           subtitle = "50% threshold", x = "Outcome",y = "Rate") +
+      plotTheme() + theme(axis.text.x = element_text(angle = 45, hjust = 1)),
+filter(testProbs.thresholds_All, Threshold == .6)  %>%
+  dplyr::select(Accuracy, starts_with("Rate")) %>%
+  gather(Variable, Value) %>%
+    ggplot(aes(Variable, Value)) +
+      geom_bar(stat = "identity") +
+      ylim(0,1)+
+      labs(title="",
+           subtitle = "60% threshold", x = "Outcome",y = "Rate") +
+      plotTheme() + theme(axis.text.x = element_text(angle = 45, hjust = 1)),
+filter(testProbs.thresholds_All, Threshold == .4)  %>%
+  dplyr::select(Accuracy, starts_with("Rate")) %>%
+  gather(Variable, Value) %>%
+    ggplot(aes(Variable, Value)) +
+      geom_bar(stat = "identity") +
+      ylim(0,1)+
+      labs(title="",
+           subtitle = "40% threshold", x = "Outcome",y = "Rate") +
+      plotTheme() + theme(axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+
+```{r cost_benefit, message = FALSE, warning = FALSE}
+cost_benefit_table <-
+   testProbs.thresholds_All %>%
+       mutate(Revenue_TP = Count_TP * ((-100 * 12) + (-45000)),
+              Revenue_TN = Count_TN * ((-300 * 12) + 15080),
+              Revenue_FP = Count_FP * ((-100 * 12) + 15080),
+              Revenue_FN = Count_FN * ((-300 * 12) + (-45000)),
+              Revenue_Total = Revenue_TP + Revenue_TN + Revenue_FP + Revenue_FN) 
+cost_benefit_table_pivot <- cost_benefit_table %>%
+  pivot_longer(
+    cols = c(Revenue_TP, Revenue_TN, Revenue_FP, Revenue_FN, Revenue_Total),
+    names_to = "Variable",
+    values_to = "Revenue"
+  ) 
+cost_benefit_table_pivot %>%
+  dplyr::select(Threshold, Variable, Revenue) %>% 
+  filter(Threshold==0.40 | Threshold==0.50 | Threshold==0.60) %>%
+  kable(caption = "Table 1 Cost/Benefit Table by threshold") %>% kable_styling()
+```
+
+```{r fig3, fig.height=10, fig.width=5, warning = FALSE, message = FALSE}
+whichThreshold <- cost_benefit_table %>%
+  dplyr::select(Threshold, Revenue_TP, Revenue_TN, Revenue_FP, Revenue_FN, Revenue_Total) %>%
+  pivot_longer(cols = c(Revenue_TP, Revenue_TN, Revenue_FP, Revenue_FN, Revenue_Total),
+               names_to = "Variable", values_to = "Revenue") %>%
+  ggplot() +
+  geom_point(aes(x = Threshold, y = Revenue, colour = Variable)) + 
+   scale_fill_manual(values = palette_9_colors) +
+   plotTheme()+
+  labs(title = "Revenue by confusion matrix type and threshold",
+       y = "Revenue") +
+  guides(colour = guide_legend(title = "Confusion Matrix"))
+
+modelRevenue <- cost_benefit_table %>%
+         dplyr::select(Threshold, Revenue_Total) %>%
+ggplot()+
+  geom_line(aes(x = Threshold, y = Revenue_Total))+
+  geom_vline(xintercept =  pull(arrange(cost_benefit_table %>%
+         dplyr::select(Threshold, Revenue_Total), -Revenue_Total)[1,1]))+
+  plotTheme()+
+    labs(title = "Model Revenues By Threshold For Test Sample",
+         subtitle = "Vertical Line Denotes Optimal Threshold")
+
+grid.arrange(whichThreshold, modelRevenue, ncol=1)
+```
+
+c. Aspect of Fairness
+
+::: {style="text-indent: 40px; margin-left: 20px;"}
+By race, Caucasians are treated more tolerate than African-Americans. African-Americans have a higher recidivism rate than Caucasians. However, the False Positive rate for African-Americans is also higher than that for Caucasians, and the False Negative rate for African-Americans is lower than that for Caucasians. This fairness issue varies depending on the threshold, as shown in Figure 3. Since we should consider trade off between the fairness and the accuracy of the model, we accept the threshold 0.4 as the optimal threshold.
+:::
+
+```{r fig4, fig.height=10, fig.width=8, warning = FALSE, message = FALSE}
+plot1 <- filter(testProbs.thresholds, Threshold == .5)  %>%
+  dplyr::select(Accuracy, Race, starts_with("Rate")) %>%
+  gather(Variable, Value, -Race) %>%
+    ggplot(aes(Variable, Value, fill = Race)) +
+      geom_bar(aes(fill = Race), position = "dodge", stat = "identity") +
+      ylim(0,1)+
+      scale_fill_manual(values = palette_3_colors) +
+      labs(title="Confusion matrix rates by race",
+           subtitle = "50% threshold", x = "Outcome",y = "Rate") +
+      plotTheme() + theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position="none")
+
+plot2 <- filter(testProbs.thresholds, Threshold == .6)  %>%
+  dplyr::select(Accuracy, Race, starts_with("Rate")) %>%
+  gather(Variable, Value, -Race) %>%
+    ggplot(aes(Variable, Value, fill = Race)) +
+      geom_bar(aes(fill = Race), position = "dodge", stat = "identity") +
+      ylim(0,1)+
+      scale_fill_manual(values = palette_3_colors) +
+      labs(title="",
+           subtitle = "60% threshold", x = "Outcome",y = "Rate") +
+      plotTheme() + theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position="none")
+
+plot3 <- filter(testProbs.thresholds, Threshold == 0.4)  %>%
+  dplyr::select(Accuracy, Race, starts_with("Rate")) %>%
+  gather(Variable, Value, -Race) %>%
+    ggplot(aes(Variable, Value, fill = Race)) +
+      geom_bar(aes(fill = Race), position = "dodge", stat = "identity") +
+      ylim(0,1)+
+      scale_fill_manual(values = palette_3_colors) +
+      labs(title="",
+           subtitle = "40% threshold", x = "Outcome",y = "Rate") +
+      plotTheme() + theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position="none")
+
+plot4 <- filter(testProbs.thresholds, Threshold == .8)  %>%
+  dplyr::select(Accuracy, Race, starts_with("Rate")) %>%
+  gather(Variable, Value, -Race) %>%
+    ggplot(aes(Variable, Value, fill = Race)) +
+      geom_bar(aes(fill = Race), position = "dodge", stat = "identity") +
+      ylim(0,1)+
+      scale_fill_manual(values = palette_3_colors) +
+      labs(title="Confusion matrix rates by race",
+           subtitle = "80% threshold", x = "Outcome",y = "Rate") +
+      plotTheme() + theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position="none")
+
+plot5 <- filter(testProbs.thresholds, Threshold == .7)  %>%
+  dplyr::select(Accuracy, Race, starts_with("Rate")) %>%
+  gather(Variable, Value, -Race) %>%
+    ggplot(aes(Variable, Value, fill = Race)) +
+      geom_bar(aes(fill = Race), position = "dodge", stat = "identity") +
+      ylim(0,1)+
+      scale_fill_manual(values = palette_3_colors) +
+      labs(title="",
+           subtitle = "70% threshold", x = "Outcome",y = "Rate") +
+      plotTheme() + theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position="none")
+
+plot6 <- filter(testProbs.thresholds, Threshold == 0.3)  %>%
+  dplyr::select(Accuracy, Race, starts_with("Rate")) %>%
+  gather(Variable, Value, -Race) %>%
+    ggplot(aes(Variable, Value, fill = Race)) +
+      geom_bar(aes(fill = Race), position = "dodge", stat = "identity") +
+      ylim(0,1)+
+      scale_fill_manual(values = palette_3_colors) +
+      labs(title="",
+           subtitle = "30% threshold", x = "Outcome",y = "Rate") +
+      plotTheme() + theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position="none")
+
+legend <- get_legend(op)
+
+grid.arrange(
+  arrangeGrob(plot1, plot2, plot3, ncol = 3),
+  arrangeGrob(plot4, plot5, plot6, ncol = 3),
+  legend,
+  ncol = 1,
+  heights = c(10,10,1)
+)
+```
+
+```{r testrace, warning = FALSE, message = FALSE}
+testProbs.thresholds_AfrAme <- testProbs.thresholds %>%
+  dplyr::select(Race, Accuracy, starts_with("Rate"), Threshold) %>%
+  filter(Race=="African-American") %>%
+  rename(Accuracy_AfrAme = Accuracy,
+         Rate_TP_AfrAme = Rate_TP,
+         Rate_FP_AfrAme = Rate_FP,
+         Rate_FN_AfrAme = Rate_FN,
+         Rate_TN_AfrAme = Rate_TN) %>%
+  dplyr::select(., -Race)
+
+testProbs.thresholds_Cauc <- testProbs.thresholds %>%
+  dplyr::select(Race, Accuracy, starts_with("Rate"), Threshold) %>%
+  filter(Race=="Caucasian") %>%
+  rename(Accuracy_Cauc = Accuracy,
+         Rate_TP_Cauc = Rate_TP,
+         Rate_FP_Cauc = Rate_FP,
+         Rate_FN_Cauc = Rate_FN,
+         Rate_TN_Cauc = Rate_TN) %>%
+  dplyr::select(., -Race)
+
+testProbs.thresholds_Race <- left_join(testProbs.thresholds_AfrAme, testProbs.thresholds_Cauc, by = "Threshold") %>%
+  mutate(diff_Accuracy = Accuracy_AfrAme - Accuracy_Cauc,
+         diff_Rate_TP = Rate_TP_AfrAme - Rate_TP_Cauc,
+         diff_Rate_FP = Rate_FP_AfrAme - Rate_FP_Cauc,
+         diff_Rate_FN = Rate_FN_AfrAme - Rate_FN_Cauc,
+         diff_Rate_TN = Rate_TN_AfrAme - Rate_TN_Cauc)
+```
+
+
+
+```{r testrace2, warning = FALSE, message = FALSE}
+result <- data.frame(
+  Accuracy_AfrAme = numeric(), Rate_FP_AfrAme = numeric(), Rate_FN_AfrAme = numeric(),
+  Accuracy_Cauc = numeric(), Rate_FP_Cauc = numeric(), Rate_FN_Cauc = numeric(),
+  Threshold_AfrAme = numeric(), Threshold_Cauc = numeric()
+)
+
+threshold_values <- seq(0, 1, by = 0.1)
+
+for (x in threshold_values) {
+  for (y in threshold_values) {
+    
+    
+    afrAme_data <- testProbs.thresholds_Race %>%
+      filter(near(Threshold, y, tol = 1e-8)) %>%
+      head(1)  
+    
+    cauc_data <- testProbs.thresholds_Race %>%
+      filter(near(Threshold, x, tol = 1e-8)) %>%
+      head(1)
+    
+    if (nrow(afrAme_data) == 0) {
+      afrAme_data <- data.frame(Accuracy_AfrAme = NA, Rate_FP_AfrAme = NA, Rate_FN_AfrAme = NA)
+    } else {
+      afrAme_data <- afrAme_data[, c("Accuracy_AfrAme", "Rate_FP_AfrAme", "Rate_FN_AfrAme")]
+    }
+    
+    if (nrow(cauc_data) == 0) {
+      cauc_data <- data.frame(Accuracy_Cauc = NA, Rate_FP_Cauc = NA, Rate_FN_Cauc = NA)
+    } else {
+      cauc_data <- cauc_data[, c("Accuracy_Cauc", "Rate_FP_Cauc", "Rate_FN_Cauc")]
+    }
+    
+    row <- cbind(afrAme_data, cauc_data, Threshold_AfrAme = y, Threshold_Cauc = x)
+    result <- rbind(result, row)
+  }
+}
+
+
+result <- result %>%
+  mutate(diff_Rate_FP = Rate_FP_AfrAme - Rate_FP_Cauc,
+         diff_Rate_FN = Rate_FN_AfrAme - Rate_FN_Cauc,
+         diff_Rate = abs(diff_Rate_FP + diff_Rate_FN),
+         pred_comb = glue("{Threshold_AfrAme}, {Threshold_Cauc}"))
+      
+```
+
+
+```{r fig5, fig.height=10, fig.width=5, warning = FALSE, message = FALSE}
+sorted_pred_comb <- result %>%
+  dplyr::select(pred_comb, diff_Rate) %>%
+  arrange(-diff_Rate) %>%
+  pull(pred_comb)
+
+graph <- result %>%
+ 
+  dplyr::select(pred_comb, Accuracy_AfrAme, Accuracy_Cauc, diff_Rate_FP, diff_Rate_FN, Rate_FP_AfrAme, Rate_FN_AfrAme) %>%
+  gather(Metric, Value, -pred_comb) %>% 
+  ggplot(aes(x = Value, y = factor(pred_comb, levels = sorted_pred_comb), shape = Metric, color = Metric)) +
+  geom_point(size = 1) +
+   xlim(0,1)+
+  scale_shape_manual(values = c(17, 17, 16, 16, 18, 18)) +  
+  scale_color_manual(values = c("pink", "purple", "lightblue", "blue", "green", "lightblue")) + 
+  labs(
+    title = "Difference in confusion metrics & accuracies across races",
+    subtitle = "Each row represents a unique predicted probability threshold for each race",
+    x = "Value",
+    y = "Predicted Probability Threshold (Black, White)",
+    caption = "Figure 3"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 5, face = "bold"),
+    plot.subtitle = element_text(size = 2),
+    panel.background = element_rect(fill = "black"),
+    panel.grid = element_blank(),
+    legend.position = "bottom"
+  ) +
+  guides(
+    color = guide_legend(title = NULL),
+    shape = guide_legend(title = NULL)
+  )
+
+graph
+
+```
+
+**3. Recommendation**
+
+::: {style="text-indent: 40px; margin-left: 0px;"}
+To improve the City’s ex-offender job training program, the Department of Prisons recommends adopting a threshold of 0.4 for the recidivism prediction model, instead of the current 0.5. This measure is expected to contribute to enhancing overall accuracy, saving education costs, and enhancing fairness between African-American and Caucasian inmates, as well as considering those relationship trade-offs.
+:::
+
+**Reference**
+
+- [1] Coyle (2009), A Human Rights Approach to Prison Management: Handbook for Prison Staff, p. 3
+- [2] https://www.mackinac.org/S2023-01#returns-on-investment
+- [3] https://money.cnn.com/infographic/economy/education-vs-prison-costs/
+- [4] https://www.dol.gov/agencies/whd/minimum-wage/state#pa
+
+
